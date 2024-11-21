@@ -7,6 +7,8 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.LinkedBlockingQueue;
 
+// TODO some way to check if the pool has runnign threads?
+
 
 /**
  * A thread pool that that creates as many threads as there are tasks given to it.
@@ -46,7 +48,7 @@ public class GreedyThreadPool {
      * If the task returns an error stops the pool.
      * @param task task to be executed
      */
-    private void submit(Callable<Optional<Boolean>> task){
+    public void submit(Callable<Optional<Boolean>> task){
         Thread t = new Thread(() -> {
             try {
                 Optional<Boolean> res = task.call();
@@ -99,6 +101,7 @@ public class GreedyThreadPool {
      * Checks if the result of the child thread indicates an error (i.e. is empty) and if not puts it in the channel.
      * @param res result of the child thread
      */
+    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
     private void processChildResult(Optional<Boolean> res){
         if (res.isEmpty()){
             handleUnexpectedException();
@@ -127,11 +130,11 @@ public class GreedyThreadPool {
         assert errorOccurred:  "waitForThreadsToFinish() called when the pool is not stopped";
 
         for (var t : threads){
-            boolean succeded = false;
-            while(!succeded){
+            boolean succeeded = false;
+            while(!succeeded){
                 try {
                     t.join();
-                    succeded = true;
+                    succeeded = true;
                 } catch (InterruptedException e) {
                     // intentionally empty
                     // just run the loop again until the thread finishes
