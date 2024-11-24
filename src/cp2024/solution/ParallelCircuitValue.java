@@ -14,30 +14,50 @@ import java.util.concurrent.*;
 // whenever we get interrupted we should call cancel -> maybe idempotent since can be interrupted multiple times
 
 
-
 public class ParallelCircuitValue implements CircuitValue {
     private final CircuitNode node;
-    private final CircuitNode[] cachedNodeArgs;
-    private BlockingQueue<Boolean> cachedValue;
+    private CircuitNode[] cachedNodeArgs;
+    private final BlockingQueue<Boolean> cachedValue;
     boolean isCancelled;
     private final GreedyThreadPool pool;
+    private  ExecutorService traditionalPool;
     private final List<Thread> threadsWaitingForValue;
 
-    public ParallelCircuitValue(CircuitNode node) throws InterruptedException {
+    // TODO move preprocessing to compute value
+    public ParallelCircuitValue(CircuitNode node) {
         this.node = node;
-        this.cachedNodeArgs = node.getArgs(); // can throw interrupted exception
         this.cachedValue = new LinkedBlockingQueue<>();
         this.isCancelled = false;
         this.pool = new GreedyThreadPool();
         this.threadsWaitingForValue = new ArrayList<>();
     }
 
+    private void cacheChildren() throws InterruptedException {
+        this.cachedNodeArgs = node.getArgs();
+    }
+
     private void cancel() {
         assert !isCancelled : "Can't cancel twice"; // TODO make it idempotent instead?
 
         isCancelled = true;
-        pool.stop();
+        endCalculations();
         interruptThreadsWaitingForValue(); // not children threads so we need not wait for them to finish
+    }
+
+    private void endCalculations() {
+        pool.stop();
+        if(traditionalPool != null)
+        {
+            traditionalPool.shutdownNow();
+            boolean terminated = false;
+            while (!terminated) {
+                try {
+                    terminated = traditionalPool.awaitTermination(1, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    traditionalPool.shutdownNow();
+                }
+            }
+        }
     }
 
     private void interruptThreadsWaitingForValue() {
@@ -59,9 +79,10 @@ public class ParallelCircuitValue implements CircuitValue {
 
     /**
      * Wrapper for getValue that instead of throwing an exception returns an empty optional
+     *
      * @return the value of the circuit node or an empty optional if the computation failed
      */
-    public Optional<Boolean> exceptionSafeGetValue(){
+    public Optional<Boolean> exceptionSafeGetValue() {
         try {
             return Optional.of(getValue());
         } catch (InterruptedException e) {
@@ -73,20 +94,21 @@ public class ParallelCircuitValue implements CircuitValue {
     // can be changed to not have the try and return the broken circuit value
     // in the solver well catch it
     public void computeValue() {
-        if (node.getType() == NodeType.LEAF) {
-            try {
+        try {
+            if (node.getType() == NodeType.LEAF) {
                 processValueOfLeafNode();
-            } catch (InterruptedException e) {
-                cancel();
+            } else {
+                cacheChildren();
+                if (node.getType() == NodeType.IF) {
+                    processIFNode();
+                } else {
+                    processValuesOfChildren();
+                }
+                endCalculations();
             }
-        } else {
-            try {
-                processValuesOfChildren();
-            } catch (InterruptedException e) {
-                cancel();
-            }
+        } catch (InterruptedException e) {
+            cancel();
         }
-
     }
 
     private void processValueOfLeafNode() throws InterruptedException {
@@ -110,6 +132,7 @@ public class ParallelCircuitValue implements CircuitValue {
             case AND -> processAND();
             case OR -> processOR();
             case GT -> processGT();
+            case LT -> processLT();
             default -> throw new IllegalStateException("Unexpected value: " + node.getType());
         };
 
@@ -130,17 +153,55 @@ public class ParallelCircuitValue implements CircuitValue {
         ThresholdNode tnode = (ThresholdNode) node;
         int x = tnode.getThreshold();
         // TODO does this opt make senses
-        if(x < cachedNodeArgs.length - x){
+        if (x < cachedNodeArgs.length - x) {
             return processRelationNumberOfValue(x, true, Comparator.naturalOrder());
-        } else{
+        } else {
             return processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.reverseOrder());
+        }
+    }
+
+    // TODO threshold logic
+    private boolean processLT() throws InterruptedException {
+        ThresholdNode tnode = (ThresholdNode) node;
+        int x = tnode.getThreshold();
+        if (x < cachedNodeArgs.length - x) {
+            return processRelationNumberOfValue(x, true, Comparator.reverseOrder());
+        } else {
+            return processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.naturalOrder());
+        }
+    }
+
+    private void processIFNode() throws InterruptedException {
+        final int TRUE_CHILD = 0;
+        final int FALSE_CHILD = 1;
+        List<Future<Optional<Boolean>>> futures = new ArrayList<>();
+        this.traditionalPool = Executors.newFixedThreadPool(2);
+
+        for (int i = 1; i <= 2; i++) {
+            ParallelCircuitValue valueOfChild = new ParallelCircuitValue(cachedNodeArgs[i]);
+            Callable<Optional<Boolean>> task = () -> {
+                valueOfChild.computeValue();
+                return valueOfChild.exceptionSafeGetValue();
+            };
+            futures.add(traditionalPool.submit(task));
+        }
+
+        ParallelCircuitValue conditionValue = new ParallelCircuitValue(cachedNodeArgs[0]);
+        conditionValue.computeValue();
+        checkForInterruption();
+        boolean condition = conditionValue.getValue();
+        try {
+            putCachedValue(futures.get(condition ? TRUE_CHILD : FALSE_CHILD).get().orElseThrow(InterruptedException::new));
+        } catch (Exception _) {
+            throw new InterruptedException();
         }
     }
 
 
     /**
      * Processes the values of the children looking for <code>value</code> and returns <code>result</code> iff found.
-     * @param value the value to be found
+     *
+     * @param value  the value to be found
      * @param result the result to be returned if the value is found
      * @return <code>result</code> if <code>value</code> is found, <code>!result</code> otherwise
      * @throws InterruptedException if was cancelled or interrupted
@@ -148,7 +209,7 @@ public class ParallelCircuitValue implements CircuitValue {
     private boolean processSingleValueImpliesResult(boolean value, boolean result) throws InterruptedException {
         int receivedChildValues = 0;
         boolean foundValue = false;
-        while(receivedChildValues < cachedNodeArgs.length && !foundValue){
+        while (receivedChildValues < cachedNodeArgs.length && !foundValue) {
             checkForInterruption();
             boolean valueOfChild = pool.getResult().orElseThrow(InterruptedException::new);
             receivedChildValues++;
@@ -163,16 +224,17 @@ public class ParallelCircuitValue implements CircuitValue {
 
     /**
      * Processes the values of the children looking for <code>value</code> and returns <code>true</code> iff found ">" <code>number</code>
+     *
      * @param number the highest number of occurrences of <code>value</code> that is still considered a failure
-     * @param value the value to be found
-     * @param order the order of the comparison - if it's natural order then the result is true if the number of occurrences is greater than <code>number</code>
+     * @param value  the value to be found
+     * @param order  the order of the comparison - if it's natural order then the result is true if the number of occurrences is greater than <code>number</code>
      * @return <code>true</code> if the number of occurrences of <code>value</code> is "greater" than <code>number</code>, <code>false</code> otherwise
      * @throws InterruptedException if was cancelled or interrupted
      */
     private boolean processRelationNumberOfValue(int number, boolean value, Comparator<Integer> order) throws InterruptedException {
         int receivedChildValues = 0;
         int foundValues = 0;
-        while(receivedChildValues < cachedNodeArgs.length && order.compare(foundValues, number) <= 0){
+        while (receivedChildValues < cachedNodeArgs.length && order.compare(foundValues, number) <= 0) {
             checkForInterruption();
             boolean valueOfChild = pool.getResult().orElseThrow(InterruptedException::new);
             receivedChildValues++;

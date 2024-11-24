@@ -12,12 +12,11 @@ import java.util.concurrent.Future;
 
 public class ParallelCircuitSolver implements CircuitSolver {
     private boolean acceptsComputations;
-    private final int MAX_THREADS = 4;
     private final ExecutorService pool;
 
     public ParallelCircuitSolver() {
         this.acceptsComputations = true;
-        pool = Executors.newFixedThreadPool(MAX_THREADS);
+        pool = Executors.newWorkStealingPool();
     }
 
     @Override
@@ -26,18 +25,15 @@ public class ParallelCircuitSolver implements CircuitSolver {
             return new BrokenCircuitValue();
         }
 
-        return new ParallelCircuitValue();
+        ParallelCircuitValue result = new ParallelCircuitValue(c.getRoot());
+        pool.submit(result::computeValue);
+        return result;
     }
 
-    private Future<Boolean> createFutureToComputeCircuitNodeValue(CircuitNode cn) {
-        return switch(cn.getType()){
-            case LEAF ->
-        }
-    }
 
     @Override
     public void stop() {
-        /*FIX ME*/
-        throw new RuntimeException("Not implemented.");
+        acceptsComputations = false;
+        pool.shutdownNow();
     }
 }
