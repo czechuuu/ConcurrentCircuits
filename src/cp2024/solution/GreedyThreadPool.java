@@ -53,6 +53,7 @@ public class GreedyThreadPool {
             try {
                 Optional<Boolean> res = task.call();
                 processChildResult(res);
+                threads.remove(Thread.currentThread());
             } catch (Exception e) {
                 handleUnexpectedException();
             }
@@ -76,7 +77,10 @@ public class GreedyThreadPool {
             t.interrupt();
         }
         waitForThreadsToFinish();
-        // TODO clear the memory?
+
+        // clear the memory
+        threads.clear();
+        channel.clear();
     }
 
     /**

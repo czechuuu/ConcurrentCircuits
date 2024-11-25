@@ -7,96 +7,112 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.*;
-
-// we can throw an interrupted exception in the constructor
-// we should catch it and return the broken circuit value (in the solver)
-
-// whenever we get interrupted we should call cancel -> maybe idempotent since can be interrupted multiple times
-
+import java.util.logging.Logger;
 
 public class ParallelCircuitValue implements CircuitValue {
+    private static final Logger logger = Logger.getLogger(ParallelCircuitValue.class.getName());
+
     private final CircuitNode node;
     private CircuitNode[] cachedNodeArgs;
     private final BlockingQueue<Boolean> cachedValue;
-    boolean isCancelled;
+    private volatile boolean isCancelled;
     private final GreedyThreadPool pool;
-    private  ExecutorService traditionalPool;
+    private ExecutorService traditionalPool;
     private final List<Thread> threadsWaitingForValue;
 
-    // TODO move preprocessing to compute value
     public ParallelCircuitValue(CircuitNode node) {
         this.node = node;
         this.cachedValue = new LinkedBlockingQueue<>();
         this.isCancelled = false;
         this.pool = new GreedyThreadPool();
         this.threadsWaitingForValue = new ArrayList<>();
+        logger.info(() -> "Initialized ParallelCircuitValue for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
     }
 
     private void cacheChildren() throws InterruptedException {
+        logger.info(() -> "Caching children of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         this.cachedNodeArgs = node.getArgs();
     }
 
     private void cancel() {
-        assert !isCancelled : "Can't cancel twice"; // TODO make it idempotent instead?
-
+        if (isCancelled) {
+            logger.warning(() -> "Attempt to cancel already cancelled node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+            return;
+        }
         isCancelled = true;
+        logger.info(() -> "Cancelling computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         endCalculations();
-        interruptThreadsWaitingForValue(); // not children threads so we need not wait for them to finish
+        interruptThreadsWaitingForValue();
     }
 
     private void endCalculations() {
+        logger.info(() -> "Ending calculations for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         pool.stop();
-        if(traditionalPool != null)
-        {
+        if (traditionalPool != null) {
             traditionalPool.shutdownNow();
             boolean terminated = false;
             while (!terminated) {
                 try {
                     terminated = traditionalPool.awaitTermination(1, TimeUnit.SECONDS);
+                    logger.info(() -> "Waiting for traditionalPool to terminate in thread " + Thread.currentThread().getName());
                 } catch (InterruptedException e) {
+                    logger.warning(() -> "Thread interrupted while waiting for traditionalPool shutdown in thread " + Thread.currentThread().getName());
                     traditionalPool.shutdownNow();
+                    Thread.currentThread().interrupt(); // Preserve interrupt status
                 }
             }
         }
     }
 
     private void interruptThreadsWaitingForValue() {
-        for (Thread t : threadsWaitingForValue) {
-            t.interrupt();
+        logger.info(() -> "Interrupting threads waiting for value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+        synchronized (threadsWaitingForValue) {
+            for (Thread t : threadsWaitingForValue) {
+                logger.info(() -> "Interrupting thread " + t.getName());
+                t.interrupt();
+            }
         }
     }
 
     @Override
     public boolean getValue() throws InterruptedException {
-        if (isCancelled)
+        if (isCancelled) {
+            logger.warning(() -> "Attempt to get value from cancelled node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             throw new InterruptedException();
+        }
 
-        threadsWaitingForValue.add(Thread.currentThread());
-        boolean value = takeCachedValue(); // can throw interrupted exception caused by cancel
-        threadsWaitingForValue.remove(Thread.currentThread());
+        synchronized (threadsWaitingForValue) {
+            threadsWaitingForValue.add(Thread.currentThread());
+        }
+        logger.info(() -> "Getting value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+
+        boolean value = takeCachedValue();
+        synchronized (threadsWaitingForValue) {
+            threadsWaitingForValue.remove(Thread.currentThread());
+        }
+
+        logger.info(() -> "Returning computed value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         return value;
     }
 
-    /**
-     * Wrapper for getValue that instead of throwing an exception returns an empty optional
-     *
-     * @return the value of the circuit node or an empty optional if the computation failed
-     */
     public Optional<Boolean> exceptionSafeGetValue() {
         try {
+            logger.info(() -> "Safely getting value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             return Optional.of(getValue());
         } catch (InterruptedException e) {
+            logger.warning(() -> "Exception during safe value retrieval for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             return Optional.empty();
         }
     }
 
-    // todo dont
-    // can be changed to not have the try and return the broken circuit value
-    // in the solver well catch it
     public void computeValue() {
         try {
+            logger.info(() -> "Starting computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             if (node.getType() == NodeType.LEAF) {
                 processValueOfLeafNode();
+            } else if (node.getType() == NodeType.NOT) {
+                cacheChildren();
+                processNOTNode();
             } else {
                 cacheChildren();
                 if (node.getType() == NodeType.IF) {
@@ -106,7 +122,9 @@ public class ParallelCircuitValue implements CircuitValue {
                 }
                 endCalculations();
             }
+            logger.info(() -> "Finished computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         } catch (InterruptedException e) {
+            logger.warning(() -> "Computation interrupted for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             cancel();
         }
     }
@@ -152,23 +170,20 @@ public class ParallelCircuitValue implements CircuitValue {
     private boolean processGT() throws InterruptedException {
         ThresholdNode tnode = (ThresholdNode) node;
         int x = tnode.getThreshold();
-        // TODO does this opt make senses
-        if (x < cachedNodeArgs.length - x) {
-            return processRelationNumberOfValue(x, true, Comparator.naturalOrder());
-        } else {
-            return processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.reverseOrder());
-        }
+        return processRelationNumberOfValue(x, true, Comparator.naturalOrder());
     }
 
     // TODO threshold logic
     private boolean processLT() throws InterruptedException {
         ThresholdNode tnode = (ThresholdNode) node;
         int x = tnode.getThreshold();
-        if (x < cachedNodeArgs.length - x) {
-            return processRelationNumberOfValue(x, true, Comparator.reverseOrder());
-        } else {
-            return processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.naturalOrder());
-        }
+        return processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.naturalOrder());
+    }
+
+    private void processNOTNode() throws InterruptedException {
+        ParallelCircuitValue valueOfChild = new ParallelCircuitValue(cachedNodeArgs[0]);
+        valueOfChild.computeValue();
+        putCachedValue(!valueOfChild.exceptionSafeGetValue().orElseThrow(InterruptedException::new));
     }
 
     private void processIFNode() throws InterruptedException {
@@ -246,6 +261,7 @@ public class ParallelCircuitValue implements CircuitValue {
 
     private void checkForInterruption() throws InterruptedException {
         if (Thread.interrupted()) {
+            logger.warning(() -> "Thread interrupted during computation of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             cancel();
             throw new InterruptedException();
         }
@@ -259,9 +275,10 @@ public class ParallelCircuitValue implements CircuitValue {
      * @throws InterruptedException if was cancelled or interrupted
      */
     private Boolean takeCachedValue() throws InterruptedException {
-        // BlockingQueue does not provide a blocking method for peeking at an element
+        logger.info(() -> "Waiting to take cached value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         boolean value = cachedValue.take();
         cachedValue.put(value);
+        logger.info(() -> "Retrieved cached value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         return value;
     }
 
@@ -274,5 +291,14 @@ public class ParallelCircuitValue implements CircuitValue {
     private void putCachedValue(boolean value) throws InterruptedException {
         assert cachedValue.isEmpty();
         cachedValue.put(value);
+    }
+
+    // TODO for debugging
+    private String noderepr(CircuitNode node) {
+        try{
+            return node.getType().toString() + "; arity: " + node.getArgs().length;
+        } catch (Exception e){
+            return "node repr error";
+        }
     }
 }

@@ -1,7 +1,8 @@
-package cp2024.solution;
+package cp2024.tests;
 
 import cp2024.circuit.*;
 import cp2024.demo.SequentialSolver;
+import cp2024.solution.ParallelCircuitSolver;
 
 import java.time.Duration;
 

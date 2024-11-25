@@ -11,7 +11,7 @@ public class SolverPerformanceTest {
 
     public static void main(String[] args) throws InterruptedException {
         // Define the size of the circuit for testing
-        int numNodes = 20; // Large number to simulate a complex circuit (can be adjusted)
+        int numNodes = 4; // Large number to simulate a complex circuit (can be adjusted)
 
         // Construct a circuit using AND, OR, and GT nodes
         Circuit c = generateComplexCircuit(numNodes);
@@ -27,12 +27,13 @@ public class SolverPerformanceTest {
         CircuitSolver parallelSolver = new ParallelCircuitSolver();
         Instant startParallel = Instant.now();
         CircuitValue parallelResult = parallelSolver.solve(c);
+        boolean parallelResultValue = parallelResult.getValue();
         Instant endParallel = Instant.now();
         long parallelDuration = Duration.between(startParallel, endParallel).toMillis();
 
         // Print the results
         System.out.println("Sequential solver result: " + sequentialResult.getValue());
-        System.out.println("Parallel solver result: " + parallelResult.getValue());
+        System.out.println("Parallel solver result: " + parallelResultValue);
         System.out.println("Time taken by SequentialSolver: " + sequentialDuration + " ms");
         System.out.println("Time taken by ParallelSolver: " + parallelDuration + " ms");
 

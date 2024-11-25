@@ -1,7 +1,8 @@
-package cp2024.solution;
+package cp2024.tests;
 
 import cp2024.circuit.*;
 import cp2024.demo.SequentialSolver;
+import cp2024.solution.ParallelCircuitSolver;
 
 import java.time.Duration;
 
@@ -81,6 +82,7 @@ public class ComprehensiveTests {
         System.out.println("Expected IF result (LT condition): true"); // Expected: LT should return true, so IF should return true
         CircuitValue result5 = solver.solve(c5);
         System.out.println("IF result (LT condition): " + result5.getValue());
+        System.out.println("SKIBIDI!");
 
         // 6. Test for delayed NOT operation
         Circuit c6 = new Circuit(
