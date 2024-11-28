@@ -4,398 +4,406 @@ import cp2024.circuit.*;
 
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 public class ParallelCircuitValue implements CircuitValue {
-    private static final Logger logger = Logger.getLogger(ParallelCircuitValue.class.getName());
-    static{
-        logger.setLevel(Level.OFF);
-    }
-
     private final CircuitNode node;
-    private CircuitNode[] cachedNodeArgs;
-    private final BlockingQueue<Boolean> cachedValue;
-    private volatile boolean isCancelled;
-    private final GreedyThreadPool pool;
-    private ExecutorService traditionalPool;
-    private final List<Thread> threadsWaitingForValue;
+    private boolean isCancelled;
+    //TODO how do interrupts work if im reusing my thread to calculate the condition in the IF etc.
 
-    public ParallelCircuitValue(CircuitNode node) {
+    /**
+     * Used to await for the computation of the value, or cancellation of the computation.
+     */
+    private final CountDownLatch latch;
+
+    /**
+     * Uninitialized must not be read until the latch is broken.
+     */
+    private boolean value;
+
+    /**
+     * List of all the tasks for the children of the current node.
+     */
+    private final List<Future<Optional<Boolean>>> childrenTasks;
+
+    /**
+     * The pool on which all the child computations are executed.
+     */
+    private final ExecutorService pool;
+
+    /**
+     * The channel to the parent, where the value of the current node will be sent when computed.
+     */
+    private final BlockingQueue<Optional<Boolean>> channelToParent;
+
+    /**
+     * The channel to the children, from which the values of the children will be read.
+     */
+    private final BlockingQueue<Optional<Boolean>> channelToChildren;
+
+
+    public ParallelCircuitValue(CircuitNode node, BlockingQueue<Optional<Boolean>> channelToParent, ExecutorService pool) {
         this.node = node;
-        this.cachedValue = new LinkedBlockingQueue<>();
         this.isCancelled = false;
-        this.pool = new GreedyThreadPool();
-        this.threadsWaitingForValue = Collections.synchronizedList(new ArrayList<>());
-        logger.info(() -> "Initialized ParallelCircuitValue for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+        this.latch = new CountDownLatch(1);
+        this.childrenTasks = Collections.synchronizedList(new ArrayList<>()); // is this good enough?
+        this.pool = pool;
+        this.channelToParent = channelToParent;
+        this.channelToChildren = new LinkedBlockingQueue<>();
     }
 
-    private void cacheChildren() throws InterruptedException {
-        logger.info(() -> "Caching children of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        this.cachedNodeArgs = node.getArgs();
-    }
 
-    private void cancel() {
+    /**
+     * Sets the status of the circuit value to cancelled.
+     * All further or yet unfinished (i.e. ones that have hung on the latch awaiting the computation fo the value)
+     * of <code>getValue()</code> will throw <code>InterruptedException</code>
+     * Cancels all children computations and waits for them to finish.
+     * Sends an empty optional to the parent, to signal that it was cancelled, so if the cancellation was unexpected,
+     * it propagates upwards.
+     * If the computation was already cancelled, does nothing.
+     */
+    private synchronized void cancel() { // TODO synchronized required?
         if (isCancelled) {
-            logger.warning(() -> "Attempt to cancel already cancelled node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             return;
         }
+
         isCancelled = true;
-        logger.info(() -> "Cancelling computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        endCalculations();
-        interruptThreadsWaitingForValue();
+        latch.countDown(); // to unlock all threads waiting for the value, that need to get an exception
+        propagateCancelToChildren();
+        signalCancellationToParent();
+        // TODO maybe add an exit(0)?
     }
 
-    private void endCalculations() {
-        logger.info(() -> "Ending calculations for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        pool.stop();
-        if (traditionalPool != null) {
-            traditionalPool.shutdownNow();
-            boolean terminated = false;
-            while (!terminated) {
+    /**
+     * Propagates the cancel signal to all children of the current node, waiting for them to finish.
+     */
+    private void propagateCancelToChildren() {
+        // cancel all children
+        for (Future<?> task : childrenTasks) {
+            task.cancel(true);
+        }
+
+        // and wait until they are finished
+        for (Future<?> task : childrenTasks) {
+            boolean finished = false;
+            while (!finished) {
                 try {
-                    terminated = traditionalPool.awaitTermination(1, TimeUnit.SECONDS);
-                    logger.info(() -> "Waiting for traditionalPool to terminate in thread " + Thread.currentThread().getName());
-                } catch (InterruptedException e) {
-                    logger.warning(() -> "Thread interrupted while waiting for traditionalPool shutdown in thread " + Thread.currentThread().getName());
-                    traditionalPool.shutdownNow();
-                    Thread.currentThread().interrupt(); // Preserve interrupt status
+                    task.get();
+                    finished = true;
+                } catch (InterruptedException | ExecutionException e) {
+                    // ignore, because we need to wait for all children to finish
                 }
             }
         }
     }
 
-    private void interruptThreadsWaitingForValue() {
-        logger.info(() -> "Interrupting threads waiting for value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+    /**
+     * Puts an empty optional into the channel to the parent, signalling that the computation was cancelled.
+     * If the parent didn't expect the cancellation, it will propagate it upwards.
+     * If the parent expected the cancellation (i.e. he called for it himself) it should ignore the signal.
+     */
+    private void signalCancellationToParent() {
+        if (channelToParent == null) {
+            return;
+        }
 
-        for (Thread t : threadsWaitingForValue) {
-            logger.info(() -> "Interrupting thread " + t.getName());
-            t.interrupt();
+        boolean sent = false;
+        while (!sent) {
+            try {
+                channelToParent.put(Optional.empty());
+                sent = true;
+            } catch (InterruptedException e) {
+                // ignore, try again - the parent must be able to receive the signal
+            }
+        }
+    }
+
+    /**
+     * Tries to put the value into the channel to the parent.
+     * If it doesn't succeed then cancels the computation and throws an exception.
+     *
+     * @param result the value to be sent to the parent
+     * @throws InterruptedException if the value couldn't be sent to the parent
+     */
+    private void sendResultToParent(boolean result) throws InterruptedException {
+        if (channelToParent == null) {
+            return;
+        }
+
+        try {
+            channelToParent.put(Optional.of(result));
+        } catch (InterruptedException e) {
+            cancel();
+            throw e;
         }
 
     }
 
+    /**
+     * Tries to set the value of the circuit value, and send it to the parent.
+     * If it fails then cancels the computation and throws an exception.
+     *
+     * @param value the value to be set as the value of the circuit
+     * @throws InterruptedException if the value couldn't be sent to the parent
+     */
+    private void setValue(boolean value) throws InterruptedException {
+        this.value = value;
+        sendResultToParent(value); // this can fail and throw, but if it does it also cancels
+        latch.countDown();
+    }
+
+    /**
+     * Attempts to read the value of the circuit value.
+     * Can throw if the computation was cancelled
+     *
+     * @return the computed value of the circuit
+     * @throws InterruptedException if the computation was cancelled, or the thread was interrupted while waiting for the value
+     */
     @Override
     public boolean getValue() throws InterruptedException {
+        // this awaiting can throw!
+        latch.await(); // wait until the computation is finished or cancelled
+
         if (isCancelled) {
-            logger.warning(() -> "Attempt to get value from cancelled node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             throw new InterruptedException();
         }
-
-
-        threadsWaitingForValue.add(Thread.currentThread());
-
-        logger.info(() -> "Getting value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        if (cachedValue.isEmpty()) {
-            logger.info(() -> "Going to wait for value of: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        }
-
-        boolean value = takeCachedValue();
-
-        threadsWaitingForValue.remove(Thread.currentThread());
-
-
-        logger.info(() -> "Returning computed value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         return value;
     }
 
-    public Optional<Boolean> exceptionSafeGetValue() {
-        try {
-            logger.info(() -> "Safely getting value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-            return Optional.of(getValue());
-        } catch (InterruptedException e) {
-            logger.warning(() -> "Exception during safe value retrieval for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-            e.printStackTrace();
-            return Optional.empty();
-        }
-    }
-
+    // TODO make sure theres no leftover bugs
     public void computeValue() {
         try {
-            logger.info(() -> "Starting computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             if (node.getType() == NodeType.LEAF) {
-                processValueOfLeafNode();
+                computeValueOfLeafNode();
             } else if (node.getType() == NodeType.NOT) {
-                cacheChildren();
-                processNOTNode();
+                computeValueOfNotNode();
             } else {
-                cacheChildren();
                 if (node.getType() == NodeType.IF) {
-                    processIFNode();
+                    computeValueOfIfNode();
                 } else {
-                    processValuesOfChildren();
+                    computeValueOfMultipleChildNode();
                 }
-                endCalculations();
             }
-            logger.info(() -> "Finished computation for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
         } catch (InterruptedException e) {
-            logger.warning(() -> "Computation interrupted for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
             cancel();
         }
     }
 
-    private void processValueOfLeafNode() throws InterruptedException {
-        logger.info(() -> "Processing leaf node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+    /**
+     * Tries to get the value of the leaf and set it as the value of the circuit.
+     * If it fails then cancels the computation and throws an exception.
+     *
+     * @throws InterruptedException if getting the value of the leaf or sending it to the parent fails
+     */
+    private void computeValueOfLeafNode() throws InterruptedException {
         try {
-            LeafNode leaf = (LeafNode) node;
-            boolean value = leaf.getValue();
-            putCachedValue(value);
-            logger.info(() -> "Processed leaf value: " + value + " in thread " + Thread.currentThread().getName());
+            LeafNode leafNode = (LeafNode) node;
+            boolean valueOfTheLeaf = leafNode.getValue(); // can fail getting the value of the leaf
+            setValue(valueOfTheLeaf); // can fail sending the value to the parent
         } catch (InterruptedException e) {
-            logger.warning(() -> "Interrupted while processing leaf node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+            cancel();
             throw e;
         }
     }
 
-    private void processValuesOfChildren() throws InterruptedException {
-        logger.info(() -> "Processing children of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+    /**
+     * Tries to get the value of the child of the NOT node and set it as the value of the circuit.
+     *
+     * @throws InterruptedException if the computation or setting the value fails
+     */
+    private void computeValueOfNotNode() throws InterruptedException {
         try {
-            for (CircuitNode child : cachedNodeArgs) {
-                checkForInterruption(); // can throw
-                logger.info(() -> "Submitting task for child: " + noderepr(child) + " in thread " + Thread.currentThread().getName());
-
-                ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child);
-                Callable<Optional<Boolean>> task = () -> {
-                    valueOfChild.computeValue();
-                    return valueOfChild.exceptionSafeGetValue();
-                };
-                pool.submit(task);
-            }
-
-            boolean nodeValue = switch (node.getType()) {
-                case AND -> processAND();
-                case OR -> processOR();
-                case GT -> processGT();
-                case LT -> processLT();
-                default -> {
-                    logger.severe(() -> "Unexpected node type: " + node.getType() + " in thread " + Thread.currentThread().getName());
-                    throw new IllegalStateException("Unexpected value: " + node.getType());
-                }
-            };
-
-            putCachedValue(nodeValue);
-            logger.info(() -> "Processed children for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        } catch (InterruptedException e) {
-            logger.warning(() -> "Interrupted while processing children of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-            Thread.currentThread().interrupt(); // Preserve interrupt status
-            throw e;
-        }
-    }
-
-    private boolean processAND() throws InterruptedException {
-        logger.info(() -> "Processing AND node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        boolean result = processSingleValueImpliesResult(false, false);
-        logger.info(() -> "Result of AND node: " + result + " in thread " + Thread.currentThread().getName());
-        return result;
-    }
-
-    private boolean processOR() throws InterruptedException {
-        logger.info(() -> "Processing OR node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        boolean result = processSingleValueImpliesResult(true, true);
-        logger.info(() -> "Result of OR node: " + result + " in thread " + Thread.currentThread().getName());
-        return result;
-    }
-
-    private boolean processGT() throws InterruptedException {
-        logger.info(() -> "Processing GT node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        ThresholdNode tnode = (ThresholdNode) node;
-        int x = tnode.getThreshold();
-        boolean result = processRelationNumberOfValue(x, true, Comparator.naturalOrder());
-        logger.info(() -> "Result of GT node: " + result + " in thread " + Thread.currentThread().getName());
-        return result;
-    }
-
-    private boolean processLT() throws InterruptedException {
-        logger.info(() -> "Processing LT node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        ThresholdNode tnode = (ThresholdNode) node;
-        int x = tnode.getThreshold();
-        boolean result = processRelationNumberOfValue(cachedNodeArgs.length - x, false, Comparator.naturalOrder());
-        logger.info(() -> "Result of LT node: " + result + " in thread " + Thread.currentThread().getName());
-        return result;
-    }
-
-    private void processNOTNode() throws InterruptedException {
-        logger.info(() -> "Processing NOT node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        try {
-            ParallelCircuitValue valueOfChild = new ParallelCircuitValue(cachedNodeArgs[0]);
+            CircuitNode child = node.getArgs()[0];
+            ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child, channelToChildren, pool);
             valueOfChild.computeValue();
-            boolean result = !valueOfChild.exceptionSafeGetValue().orElseThrow(InterruptedException::new);
-            putCachedValue(result);
-            logger.info(() -> "Result of NOT node: " + result + " in thread " + Thread.currentThread().getName());
+            boolean valueOfTheChild = valueOfChild.getValue();
+            setValue(!valueOfTheChild);
         } catch (InterruptedException e) {
-            logger.warning(() -> "Interrupted while processing NOT node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+            cancel();
             throw e;
         }
     }
 
-    private void processIFNode() throws InterruptedException {
-        logger.info(() -> "Processing IF node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        final int TRUE_CHILD = 0;
-        final int FALSE_CHILD = 1;
-        List<Future<Optional<Boolean>>> futures = new ArrayList<>();
-        this.traditionalPool = Executors.newFixedThreadPool(2);
+    /**
+     * Creates a lambda that computes the value of the given child and returns it as an optional.
+     * The lambda should be submitted to the pool.
+     *
+     * @param child the child whose value is to be computed (concurrently)
+     * @return the lambda to be run on the pool
+     */
+    private Callable<Optional<Boolean>> poolTaskForGivenChild(CircuitNode child) {
+        ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child, channelToChildren, pool);
+        return () -> {
+            try {
+                valueOfChild.computeValue();
+                return Optional.of(valueOfChild.getValue());
+            } catch (InterruptedException e) {
+                return Optional.empty();
+            }
+        };
+    }
 
+    /**
+     * Tries to compute the value of the IF node.
+     *
+     * @throws InterruptedException if the computation fails
+     */
+    private void computeValueOfIfNode() throws InterruptedException {
         try {
-            for (int i = 1; i <= 2; i++) {
-                ParallelCircuitValue valueOfChild = new ParallelCircuitValue(cachedNodeArgs[i]);
-                int finalI = i;
-                logger.info(() -> "Submitting IF node branch " + finalI + ": " + noderepr(cachedNodeArgs[finalI]) + " in thread " + Thread.currentThread().getName());
-                Callable<Optional<Boolean>> task = () -> {
-                    valueOfChild.computeValue();
-                    return valueOfChild.exceptionSafeGetValue();
-                };
-                futures.add(traditionalPool.submit(task));
+            CircuitNode[] args = node.getArgs(); // can throw
+            final int conditionIndexInArgs = 0;
+            final int ifTrueIndexInArgs = 1;
+            final int ifFalseIndexInArgs = 2;
+
+            for (int i = ifTrueIndexInArgs; i < ifFalseIndexInArgs; i++) {
+                CircuitNode child = args[i];
+                Callable<Optional<Boolean>> task = poolTaskForGivenChild(child);
+                Future<Optional<Boolean>> future = pool.submit(task);
+                childrenTasks.add(future);
             }
 
-            ParallelCircuitValue conditionValue = new ParallelCircuitValue(cachedNodeArgs[0]);
-            conditionValue.computeValue();
-            boolean condition = conditionValue.getValue();
-            logger.info(() -> "Condition value of IF node: " + condition + " in thread " + Thread.currentThread().getName());
+            CircuitNode condition = args[conditionIndexInArgs];
+            ParallelCircuitValue valueOfCondition = new ParallelCircuitValue(condition, channelToChildren, pool);
+            // if we're interrupted while calculating the condition, we'll cancel the condition subtree
+            // then when we try to read the value of the condition, we'll get an InterruptedException
+            // and cancel the entire IF tree
+            valueOfCondition.computeValue();
+            boolean conditionValue = valueOfCondition.getValue(); // can throw
 
-            putCachedValue(futures.get(condition ? TRUE_CHILD : FALSE_CHILD).get().orElseThrow(InterruptedException::new));
-            logger.info(() -> "IF node result: " + condition + " in thread " + Thread.currentThread().getName());
-        } catch (Exception e) {
-            logger.warning(() -> "Exception in processing IF node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
+            checkForInterruption(); // if the computation of the condition was long, the result might not be needed anymore
+            int resultIndex = conditionValue ? 0 : 1;
+            // try to get the result of the child, or if it failed, cancel and throw
+            boolean result = childrenTasks.get(resultIndex).get().orElseThrow(InterruptedException::new);
+            setValue(result);
+            propagateCancelToChildren(); // we don't need the child to compute a value that won't be read
+        } catch (InterruptedException e) {
+            cancel();
+            throw e;
+        } catch (ExecutionException e) {
+            cancel();
+            throw new IllegalStateException("The child task should not throw.", e);
+        }
+    }
+
+    /**
+     * Checks if the current thread was interrupted, and if so, cancels the computation and throws an exception.
+     * Clears the interrupt status of the thread.
+     *
+     * @throws InterruptedException if the thread was interrupted
+     */
+    private void checkForInterruption() throws InterruptedException {
+        if (Thread.interrupted()) {
+            cancel();
             throw new InterruptedException();
-        } finally {
-            traditionalPool.shutdown();
         }
     }
 
 
     /**
-     * Processes the values of the children looking for <code>value</code> and returns <code>result</code> iff found.
+     * Computes the value of the circuit node with multiple children.
+     *
+     * @throws InterruptedException if the computation was cancelled or interrupted
+     */
+    private void computeValueOfMultipleChildNode() throws InterruptedException {
+        try {
+            // submit all children computation tasks
+            CircuitNode[] children = node.getArgs();
+            int numberOfChildren = children.length;
+            for (CircuitNode child : children) {
+                checkForInterruption();
+                Callable<Optional<Boolean>> task = poolTaskForGivenChild(child);
+                Future<Optional<Boolean>> future = pool.submit(task);
+                childrenTasks.add(future);
+            }
+
+            switch (node.getType()) {
+                case AND -> processAND(numberOfChildren);
+                case OR -> processOR(numberOfChildren);
+                case GT -> processGT(numberOfChildren);
+                case LT -> processLT(numberOfChildren);
+                default -> throw new IllegalStateException("Unexpected value: " + node.getType());
+
+            }
+            propagateCancelToChildren();
+        } catch (InterruptedException e) {
+            cancel();
+            throw e;
+        }
+    }
+
+    private void processAND(int N) throws InterruptedException {
+        computeValueWhereSingleChildValueImpliesTheResult(false, false, N);
+
+    }
+
+    private void processOR(int N) throws InterruptedException {
+        computeValueWhereSingleChildValueImpliesTheResult(true, true, N);
+    }
+
+    private void processGT(int N) throws InterruptedException {
+        ThresholdNode tnode = (ThresholdNode) node;
+        int x = tnode.getThreshold();
+        computeValueWhereGreaterThanAmountOf(x, true, N);
+    }
+
+    private void processLT(int N) throws InterruptedException {
+        ThresholdNode tnode = (ThresholdNode) node;
+        int x = tnode.getThreshold();
+        computeValueWhereGreaterThanAmountOf(x, false, N);
+    }
+
+
+    /**
+     * Processes the values of the children looking for <code>value</code> and set the value of the circuit
+     * to <code>result</code> if found at least one <code>value</code>.
      *
      * @param value  the value to be found
-     * @param result the result to be returned if the value is found
-     * @return <code>result</code> if <code>value</code> is found, <code>!result</code> otherwise
+     * @param result the result to be set if the value is found
      * @throws InterruptedException if was cancelled or interrupted
      */
-    private boolean processSingleValueImpliesResult(boolean value, boolean result) throws InterruptedException {
-        logger.info(() -> "Starting processSingleValueImpliesResult for node: " + noderepr(node) +
-                ", looking for value: " + value + " in thread " + Thread.currentThread().getName());
-
+    private void computeValueWhereSingleChildValueImpliesTheResult(boolean value, boolean result, int N) throws InterruptedException {
         int receivedChildValues = 0;
         boolean foundValue = false;
 
-        while (receivedChildValues < cachedNodeArgs.length && !foundValue) {
+        while (receivedChildValues < N && !foundValue) {
             checkForInterruption();
-            boolean valueOfChild = pool.getResult().orElseThrow(InterruptedException::new);
+            boolean valueOfChild = channelToChildren.take().orElseThrow(InterruptedException::new);
             receivedChildValues++;
             foundValue = valueOfChild == value;
-
-            boolean finalFoundValue = foundValue;
-            int finalReceivedChildValues = receivedChildValues;
-            logger.info(() -> "Processed child " + finalReceivedChildValues + ", value: " + valueOfChild +
-                    ", foundValue: " + finalFoundValue + " in thread " + Thread.currentThread().getName());
         }
 
-        boolean finalResult = foundValue ? result : !result;
-        logger.info(() -> "Completed processSingleValueImpliesResult for node: " + noderepr(node) +
-                ", result: " + finalResult + " in thread " + Thread.currentThread().getName());
-        return finalResult;
+        // can be simplified but I find this more readable
+        //noinspection SimplifiableConditionalExpression
+        setValue(foundValue ? result : !result);
     }
 
     /**
-     * Processes the values of the children looking for <code>value</code> and returns <code>true</code> iff found ">" <code>number</code>.
+     * Processes the values of the children looking for <code>true</code> and returns <code>true</code> iff found ">" <code>number</code>.
      *
      * @param number the highest number of occurrences of <code>value</code> that is still considered a failure
-     * @param value  the value to be found
-     * @param order  the order of the comparison - if it's natural order then the result is true if the number of occurrences is greater than <code>number</code>
-     * @return <code>true</code> if the number of occurrences of <code>value</code> is "greater" than <code>number</code>, <code>false</code> otherwise
      * @throws InterruptedException if was cancelled or interrupted
      */
-    private boolean processRelationNumberOfValue(int number, boolean value, Comparator<Integer> order) throws InterruptedException {
-        logger.info(() -> "Starting processRelationNumberOfValue for node: " + noderepr(node) +
-                ", looking for occurrences of value: " + value + ", threshold: " + number +
-                " in thread " + Thread.currentThread().getName());
+    private void computeValueWhereGreaterThanAmountOf(int number, boolean greaterThan, int N) throws InterruptedException {
+        Comparator<Integer> order = greaterThan ? Comparator.naturalOrder() : Comparator.reverseOrder();
 
         int receivedChildValues = 0;
         int foundValues = 0;
 
-        while (receivedChildValues < cachedNodeArgs.length && order.compare(foundValues, number) <= 0) {
+        while (receivedChildValues < N && foundValues <= number) {
             checkForInterruption();
-            boolean valueOfChild = pool.getResult().orElseThrow(InterruptedException::new);
+            boolean valueOfChild = channelToChildren.take().orElseThrow(InterruptedException::new);
             receivedChildValues++;
-            if (valueOfChild == value) {
+            if (valueOfChild) {
                 foundValues++;
             }
-            int finalReceivedChildValues = receivedChildValues;
-            int finalFoundValues = foundValues;
-            logger.info(() -> "Processed child " + finalReceivedChildValues + ", value: " + valueOfChild +
-                    ", found occurrences: " + finalFoundValues + " in thread " + Thread.currentThread().getName());
         }
 
-        boolean finalResult = order.compare(foundValues, number) > 0;
-        logger.info(() -> "Completed processRelationNumberOfValue for node: " + noderepr(node) +
-                ", final result: " + finalResult + " in thread " + Thread.currentThread().getName());
-        return finalResult;
+        // If we're here then either
+        // 1. we've found more than number of values so if we wanted to find more than number of values, we return true
+        //    otherwise we return false
+        // 2. we've found less than or equal to number of values but have looked through all children
+        //    so we return whether the found number fits the order we've wanted
+        setValue(order.compare(foundValues, number) > 0);
     }
 
-    private void checkForInterruption() throws InterruptedException {
-        if (Thread.interrupted()) {
-            logger.warning(() -> "Thread interrupted during computation of node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-            Thread.currentThread().interrupt(); // Preserve interrupt status
-            cancel();
-            throw new InterruptedException();
-        }
-    }
-
-    /**
-     * If cached value is present just returns it,
-     * otherwise waits for the cached value to be computed and returns it.
-     *
-     * @return the cached value
-     * @throws InterruptedException if was cancelled or interrupted
-     */
-    private Boolean takeCachedValue() throws InterruptedException {
-        logger.info(() -> "Waiting to take cached value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        boolean value = cachedValue.take();
-        cachedValue.put(value);
-        logger.info(() -> "Retrieved cached value for node: " + noderepr(node) + " in thread " + Thread.currentThread().getName());
-        return value;
-    }
-
-    /**
-     * Puts the given value into the cached value
-     *
-     * @param value to be set as the cached value of the circuit node;
-     * @throws InterruptedException if was cancelled or interrupted
-     */
-    private void putCachedValue(boolean value) throws InterruptedException {
-        assert cachedValue.isEmpty();
-        cachedValue.put(value);
-    }
-
-    // TODO for debugging
-    private String noderepr(CircuitNode node) {
-        try {
-            // Check if the node is a Leaf and print its value
-            if (node.getType() == NodeType.LEAF) {
-                return "(" + ((LeafNode) node).getValue() + ")";
-            }
-
-            StringBuilder result = new StringBuilder();
-            result.append(node.getType().toString());
-
-            // Get child nodes (if any) and process them recursively
-            CircuitNode[] children = node.getArgs();
-            if (children.length > 0) {
-                result.append(" [");
-                for (int i = 0; i < children.length; i++) {
-                    result.append(noderepr(children[i]));  // Recursively represent each child
-                    if (i < children.length - 1) {
-                        result.append(", ");  // Add comma between children
-                    }
-                }
-                result.append("]");
-            }
-
-            return result.toString();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt(); // Preserve interrupt status
-            return "node repr error";
-        }
-    }
 
 }

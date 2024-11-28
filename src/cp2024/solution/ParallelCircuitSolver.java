@@ -1,6 +1,6 @@
 package cp2024.solution;
 
-import cp2024.circuit.CircuitNode;
+
 import cp2024.circuit.CircuitSolver;
 import cp2024.circuit.CircuitValue;
 import cp2024.circuit.Circuit;
@@ -8,7 +8,6 @@ import cp2024.demo.BrokenCircuitValue;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
 public class ParallelCircuitSolver implements CircuitSolver {
     private boolean acceptsComputations;
@@ -16,7 +15,7 @@ public class ParallelCircuitSolver implements CircuitSolver {
 
     public ParallelCircuitSolver() {
         this.acceptsComputations = true;
-        pool = Executors.newWorkStealingPool();
+        pool = Executors.newCachedThreadPool();
     }
 
     @Override
@@ -25,7 +24,7 @@ public class ParallelCircuitSolver implements CircuitSolver {
             return new BrokenCircuitValue();
         }
 
-        ParallelCircuitValue result = new ParallelCircuitValue(c.getRoot());
+        ParallelCircuitValue result = new ParallelCircuitValue(c.getRoot(), null, pool);
         pool.submit(result::computeValue);
         return result;
     }

@@ -11,7 +11,7 @@ public class SolverPerformanceTest {
 
     public static void main(String[] args) throws InterruptedException {
         // Define the size of the circuit for testing
-        int numNodes = 3; // Large number to simulate a complex circuit (can be adjusted)
+        int numNodes = 10; // Large number to simulate a complex circuit (can be adjusted)
 
         // Construct a circuit using AND, OR, and GT nodes
         Circuit c = generateComplexCircuit(numNodes);
@@ -44,6 +44,7 @@ public class SolverPerformanceTest {
         } else {
             System.out.println("The solvers returned different results.");
         }
+        parallelSolver.stop();
     }
 
     // Generate a complex circuit to test the solvers' performance
