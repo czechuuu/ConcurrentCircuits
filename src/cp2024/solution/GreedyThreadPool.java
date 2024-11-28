@@ -1,8 +1,6 @@
 package cp2024.solution;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -26,29 +24,19 @@ public class GreedyThreadPool {
      * Creates a new GreedyThreadPool.
      */
     public GreedyThreadPool(){
-        this.threads = new ArrayList<>();
+        List<Thread> list = new ArrayList<>();
+        this.threads = Collections.synchronizedList(list);
         this.channel = new LinkedBlockingQueue<>();
         this.errorOccurred = false;
     }
 
-    /**
-     * Submits a list of tasks to the pool.
-     * @param tasks tasks to be executed
-     */
-    public void submitList(List<Callable<Optional<Boolean>>> tasks){
-        for (var task : tasks){
-            while(!errorOccurred){
-                this.submit(task);
-            }
-        }
-    }
 
     /**
      * Submits a single task to the pool and starts executing it in a new thread.
      * If the task returns an error stops the pool.
      * @param task task to be executed
      */
-    public void submit(Callable<Optional<Boolean>> task){
+    public synchronized void submit(Callable<Optional<Boolean>> task){
         Thread t = new Thread(() -> {
             try {
                 Optional<Boolean> res = task.call();
@@ -66,8 +54,9 @@ public class GreedyThreadPool {
      * Stops the pool and all of its threads, waiting for them to finish.
      * All further calls to getResult() will return empty.
      * Idempotent - can be called multiple times without any effect except the first one.
+     * synchronized to prevent multiple calls from different threads.
      */
-    public void stop(){
+    public synchronized void stop(){
         if(errorOccurred){
             return; // guard for multiple calls
         }

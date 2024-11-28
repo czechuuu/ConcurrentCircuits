@@ -11,10 +11,11 @@ public class SolverPerformanceTest {
 
     public static void main(String[] args) throws InterruptedException {
         // Define the size of the circuit for testing
-        int numNodes = 4; // Large number to simulate a complex circuit (can be adjusted)
+        int numNodes = 3; // Large number to simulate a complex circuit (can be adjusted)
 
         // Construct a circuit using AND, OR, and GT nodes
         Circuit c = generateComplexCircuit(numNodes);
+        printCircuitTree(c.getRoot(), 0);
 
         // Sequential solver test
         CircuitSolver sequentialSolver = new SequentialSolver();
@@ -71,6 +72,29 @@ public class SolverPerformanceTest {
             return CircuitNode.mk(NodeType.AND, left, right);
         } else {
             return CircuitNode.mk(NodeType.OR, left, right);
+        }
+    }
+    // Recursive method to print the circuit tree structure
+    private static void printCircuitTree(CircuitNode node, int indent) throws InterruptedException {
+        if (node == null) {
+            return;
+        }
+
+        // Indentation for tree levels
+        for (int i = 0; i < indent; i++) {
+            System.out.print("  ");
+        }
+
+        // Print node details
+        if (node.getType() == NodeType.LEAF) {
+            System.out.println("Leaf: " + ((LeafNode) node).getValue());
+        } else {
+            System.out.println(node.getType());
+        }
+
+        // Print child nodes recursively
+        for (CircuitNode child : node.getArgs()) {
+            printCircuitTree(child, indent + 1);
         }
     }
 }
