@@ -1,15 +1,36 @@
-package cp2024.solution;
+package cp2024.tests;
 
 import cp2024.circuit.*;
-import cp2024.demo.SequentialSolver;
+import cp2024.solution.ParallelCircuitSolver;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.MethodOrderer.OrderAnnotation;
+import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.Order;
 
 import java.time.Duration;
 
-public class NestedCircuitTests {
-    public static void main(String[] args) throws InterruptedException {
-        CircuitSolver solver = new ParallelCircuitSolver();
+import static org.junit.jupiter.api.Assertions.*;
 
-        // Deeply nested AND and OR with various conditions and delays
+@TestMethodOrder(OrderAnnotation.class)
+public class NestedCircuitTests {
+
+    private static final int SMALL_N = 5;
+    private static CircuitSolver solver;
+
+    @BeforeAll
+    public static void setUpAll() {
+        solver = new ParallelCircuitSolver();
+    }
+
+    @AfterAll
+    public static void tearDownAll() {
+        solver.stop();
+    }
+
+    @RepeatedTest(SMALL_N)
+    @Order(1)
+    public void testNestedANDORWithDelays() throws InterruptedException {
         Circuit c1 = new Circuit(
                 CircuitNode.mk(NodeType.AND,
                         CircuitNode.mk(NodeType.OR,
@@ -37,10 +58,13 @@ public class NestedCircuitTests {
                         )
                 )
         );
-        CircuitValue test1 = solver.solve(c1);
-        System.out.println("Test 1 (Deeply nested AND, OR with GT, LT, and NOT) Expected: true : " + test1.getValue());
+        CircuitValue result1 = solver.solve(c1);
+        assertTrue(result1.getValue(), "Expected: true");
+    }
 
-        // Deeply nested IF with delays to test short-circuiting and concurrency
+    @RepeatedTest(SMALL_N)
+    @Order(2)
+    public void testNestedIFANDWithDelays() throws InterruptedException {
         Circuit c2 = new Circuit(
                 CircuitNode.mk(NodeType.IF,
                         CircuitNode.mk(NodeType.OR,
@@ -70,10 +94,13 @@ public class NestedCircuitTests {
                         )
                 )
         );
-        CircuitValue test2 = solver.solve(c2);
-        System.out.println("Test 2 (Deeply nested IF with AND, OR, and delays) Expected: true : " + test2.getValue());
+        CircuitValue result2 = solver.solve(c2);
+        assertTrue(result2.getValue(), "Expected: true");
+    }
 
-        // Nested OR within AND with a mix of GT and LT thresholds and delays
+    @RepeatedTest(SMALL_N)
+    @Order(3)
+    public void testNestedORANDWithDelays() throws InterruptedException {
         Circuit c3 = new Circuit(
                 CircuitNode.mk(NodeType.AND,
                         CircuitNode.mk(NodeType.OR,
@@ -97,10 +124,16 @@ public class NestedCircuitTests {
                         )
                 )
         );
-        CircuitValue test3 = solver.solve(c3);
-        System.out.println("Test 3 (Nested OR in AND with GT and LT thresholds) Expected: true : " + test3.getValue());
+        CircuitValue result3 = solver.solve(c3);
+        long start = System.currentTimeMillis();
+        assertTrue(result3.getValue(), "Expected: true");
+        long end = System.currentTimeMillis();
+        assertTrue(end - start < 2000, "Expected: at least 2000ms");
+    }
 
-        // Complex IF-OR combination to check short-circuiting behavior with delayed nodes
+    @RepeatedTest(SMALL_N)
+    @Order(4)
+    public void testComplexIFORWithDelays() throws InterruptedException {
         Circuit c4 = new Circuit(
                 CircuitNode.mk(NodeType.IF,
                         CircuitNode.mk(NodeType.LT, 2,
@@ -128,10 +161,16 @@ public class NestedCircuitTests {
                         )
                 )
         );
-        CircuitValue test4 = solver.solve(c4);
-        System.out.println("Test 4 (Complex IF-OR with GT, LT, NOT) Expected: true : " + test4.getValue());
+        CircuitValue result4 = solver.solve(c4);
+        long start = System.currentTimeMillis();
+        assertTrue(result4.getValue(), "Expected: true");
+        long end = System.currentTimeMillis();
+        assertTrue(end - start < 2000, "Expected: about 1s");
+    }
 
-        // Deeply nested AND with NOT and delays to check the cancellation mechanism
+    @RepeatedTest(SMALL_N)
+    @Order(5)
+    public void testDeeplyNestedANDWithDelays() throws InterruptedException {
         Circuit c5 = new Circuit(
                 CircuitNode.mk(NodeType.AND,
                         CircuitNode.mk(NodeType.NOT, CircuitNode.mk(false)),
@@ -148,10 +187,7 @@ public class NestedCircuitTests {
                         )
                 )
         );
-        CircuitValue test5 = solver.solve(c5);
-        System.out.println("Test 5 (Deeply nested AND with NOT and delays) Expected: true : " + test5.getValue());
-
-        System.out.println("All nested tests completed.");
-        solver.stop();
+        CircuitValue result5 = solver.solve(c5);
+        assertTrue(result5.getValue(), "Expected: true");
     }
 }

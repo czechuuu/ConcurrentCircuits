@@ -3,6 +3,7 @@ package cp2024.tests;
 import cp2024.circuit.*;
 import cp2024.solution.ParallelCircuitSolver;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.RepeatedTest;
 
 import java.time.Duration;
 
@@ -10,20 +11,21 @@ import static org.junit.jupiter.api.Assertions.*;
 
 public class ComprehensiveTests {
 
-    private CircuitSolver solver;
+    private static final int N = 20; // Define the constant N
 
-    @BeforeEach
-    public void setUp() {
+    private static CircuitSolver solver;
+
+    @BeforeAll
+    public static void setUp() {
         solver = new ParallelCircuitSolver();
     }
 
-    @AfterEach
-    public void tearDown() {
+    @AfterAll
+    public static void tearDown() {
         solver.stop();
     }
 
-
-    @Test
+    @RepeatedTest(N)
     public void testGT() throws InterruptedException {
         Circuit c1 = new Circuit(
                 CircuitNode.mk(NodeType.GT, 2,
@@ -37,7 +39,7 @@ public class ComprehensiveTests {
         assertTrue(result1.getValue(), "Expected GT result: true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testLT() throws InterruptedException {
         Circuit c2 = new Circuit(
                 CircuitNode.mk(NodeType.LT, 2,
@@ -50,7 +52,7 @@ public class ComprehensiveTests {
         assertTrue(result2.getValue(), "Expected LT result: true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testNotGT() throws InterruptedException {
         Circuit c3 = new Circuit(
                 CircuitNode.mk(NodeType.NOT,
@@ -66,7 +68,7 @@ public class ComprehensiveTests {
         assertFalse(result3.getValue(), "Expected NOT (GT result): false");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testIfGT() throws InterruptedException {
         Circuit c4 = new Circuit(
                 CircuitNode.mk(NodeType.IF,
@@ -84,7 +86,7 @@ public class ComprehensiveTests {
         assertTrue(result4.getValue(), "Expected IF result (GT condition): true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testIfLT() throws InterruptedException {
         Circuit c5 = new Circuit(
                 CircuitNode.mk(NodeType.IF,
@@ -125,7 +127,7 @@ public class ComprehensiveTests {
         assertTrue(result7.getValue(), "Expected delayed IF result (true condition): true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testCombinedGT_LT_IF() throws InterruptedException {
         Circuit c8 = new Circuit(
                 CircuitNode.mk(NodeType.IF,
@@ -146,7 +148,7 @@ public class ComprehensiveTests {
         assertTrue(result8.getValue(), "Expected combined GT/LT IF result: true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testEdgeCase() throws InterruptedException {
         Circuit c9 = new Circuit(
                 CircuitNode.mk(NodeType.LT, 1,
@@ -157,7 +159,7 @@ public class ComprehensiveTests {
         assertTrue(result9.getValue(), "Expected edge case result: true");
     }
 
-    @Test
+    @RepeatedTest(N)
     public void testDeeplyNestedIF() throws InterruptedException {
         Circuit c10 = new Circuit(
                 CircuitNode.mk(NodeType.IF,

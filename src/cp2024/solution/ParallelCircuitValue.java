@@ -5,10 +5,11 @@ import cp2024.circuit.*;
 import java.util.*;
 import java.util.concurrent.*;
 
+// TODO why must the NOT and IF be done in parallel? cant we reuse threads?
+
 public class ParallelCircuitValue implements CircuitValue {
     private final CircuitNode node;
     private boolean isCancelled;
-    //TODO how do interrupts work if im reusing my thread to calculate the condition in the IF etc.
 
     /**
      * Used to await for the computation of the value, or cancellation of the computation.
@@ -91,7 +92,7 @@ public class ParallelCircuitValue implements CircuitValue {
                     finished = true;
                 } catch (InterruptedException | ExecutionException e) {
                     // ignore, because we need to wait for all children to finish
-                } catch(CancellationException e) {
+                } catch (CancellationException e) {
                     // i dont udnerstand this
                     finished = true;
                 }
@@ -241,7 +242,8 @@ public class ParallelCircuitValue implements CircuitValue {
                 return Optional.of(valueOfChild.getValue());
             } catch (InterruptedException e) {
                 return Optional.empty();
-            } catch (Exception e){
+            } catch (Exception e) {
+                // should be unreachable but i trust no one
                 return Optional.empty();
             }
         };
@@ -267,11 +269,6 @@ public class ParallelCircuitValue implements CircuitValue {
             }
 
             CircuitNode condition = args[conditionIndexInArgs];
-//            ParallelCircuitValue valueOfCondition = new ParallelCircuitValue(condition, channelToChildren, pool);
-//            // if we're interrupted while calculating the condition, we'll cancel the condition subtree
-//            // then when we try to read the value of the condition, we'll get an InterruptedException
-//            // and cancel the entire IF tree
-//            valueOfCondition.computeValue();
             Future<Optional<Boolean>> conditionFuture = pool.submit(poolTaskForGivenChild(condition));
             boolean conditionValue = conditionFuture.get().orElseThrow(InterruptedException::new); // can throw
 
@@ -392,7 +389,19 @@ public class ParallelCircuitValue implements CircuitValue {
         int receivedChildValues = 0;
         int foundValues = 0;
 
-        while (receivedChildValues < N && (greaterThan ? foundValues <= number : foundValues < number)) {
+        while (receivedChildValues < N) {
+            // found value can only increase
+            boolean answerAlreadyKnownTrivially = greaterThan ? foundValues > number : foundValues >= number;
+
+            int remainingChildren = N - receivedChildValues;
+            // GT: if it's still not greater than number then regardless of the rest of the children, we'll never be able to return true
+            // LT: if it's still less than number then regardless of the rest of the children, we'll never be able to return false
+            boolean worstBestCaseAnswerKnown = greaterThan ? foundValues + remainingChildren <= number : foundValues + remainingChildren < number;
+
+            if (answerAlreadyKnownTrivially || worstBestCaseAnswerKnown) {
+                break;
+            }
+
             checkForInterruption();
             boolean valueOfChild = channelToChildren.take().orElseThrow(InterruptedException::new);
             receivedChildValues++;
