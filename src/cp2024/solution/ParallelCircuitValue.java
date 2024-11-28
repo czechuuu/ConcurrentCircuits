@@ -84,13 +84,16 @@ public class ParallelCircuitValue implements CircuitValue {
 
         // and wait until they are finished
         for (Future<?> task : childrenTasks) {
-            boolean finished = false;
+            boolean finished = (task.isDone() || task.isCancelled()); // !
             while (!finished) {
                 try {
                     task.get();
                     finished = true;
                 } catch (InterruptedException | ExecutionException e) {
                     // ignore, because we need to wait for all children to finish
+                } catch(CancellationException e) {
+                    // i dont udnerstand this
+                    finished = true;
                 }
             }
         }
@@ -213,9 +216,9 @@ public class ParallelCircuitValue implements CircuitValue {
     private void computeValueOfNotNode() throws InterruptedException {
         try {
             CircuitNode child = node.getArgs()[0];
-            ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child, channelToChildren, pool);
-            valueOfChild.computeValue();
-            boolean valueOfTheChild = valueOfChild.getValue();
+            // ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child, channelToChildren, pool);
+            childrenTasks.add(pool.submit(poolTaskForGivenChild(child)));
+            boolean valueOfTheChild = channelToChildren.take().orElseThrow(InterruptedException::new);
             setValue(!valueOfTheChild);
         } catch (InterruptedException e) {
             cancel();
@@ -238,6 +241,8 @@ public class ParallelCircuitValue implements CircuitValue {
                 return Optional.of(valueOfChild.getValue());
             } catch (InterruptedException e) {
                 return Optional.empty();
+            } catch (Exception e){
+                return Optional.empty();
             }
         };
     }
@@ -254,7 +259,7 @@ public class ParallelCircuitValue implements CircuitValue {
             final int ifTrueIndexInArgs = 1;
             final int ifFalseIndexInArgs = 2;
 
-            for (int i = ifTrueIndexInArgs; i < ifFalseIndexInArgs; i++) {
+            for (int i = ifTrueIndexInArgs; i <= ifFalseIndexInArgs; i++) {
                 CircuitNode child = args[i];
                 Callable<Optional<Boolean>> task = poolTaskForGivenChild(child);
                 Future<Optional<Boolean>> future = pool.submit(task);
@@ -262,12 +267,13 @@ public class ParallelCircuitValue implements CircuitValue {
             }
 
             CircuitNode condition = args[conditionIndexInArgs];
-            ParallelCircuitValue valueOfCondition = new ParallelCircuitValue(condition, channelToChildren, pool);
-            // if we're interrupted while calculating the condition, we'll cancel the condition subtree
-            // then when we try to read the value of the condition, we'll get an InterruptedException
-            // and cancel the entire IF tree
-            valueOfCondition.computeValue();
-            boolean conditionValue = valueOfCondition.getValue(); // can throw
+//            ParallelCircuitValue valueOfCondition = new ParallelCircuitValue(condition, channelToChildren, pool);
+//            // if we're interrupted while calculating the condition, we'll cancel the condition subtree
+//            // then when we try to read the value of the condition, we'll get an InterruptedException
+//            // and cancel the entire IF tree
+//            valueOfCondition.computeValue();
+            Future<Optional<Boolean>> conditionFuture = pool.submit(poolTaskForGivenChild(condition));
+            boolean conditionValue = conditionFuture.get().orElseThrow(InterruptedException::new); // can throw
 
             checkForInterruption(); // if the computation of the condition was long, the result might not be needed anymore
             int resultIndex = conditionValue ? 0 : 1;
@@ -383,12 +389,10 @@ public class ParallelCircuitValue implements CircuitValue {
      * @throws InterruptedException if was cancelled or interrupted
      */
     private void computeValueWhereGreaterThanAmountOf(int number, boolean greaterThan, int N) throws InterruptedException {
-        Comparator<Integer> order = greaterThan ? Comparator.naturalOrder() : Comparator.reverseOrder();
-
         int receivedChildValues = 0;
         int foundValues = 0;
 
-        while (receivedChildValues < N && foundValues <= number) {
+        while (receivedChildValues < N && (greaterThan ? foundValues <= number : foundValues < number)) {
             checkForInterruption();
             boolean valueOfChild = channelToChildren.take().orElseThrow(InterruptedException::new);
             receivedChildValues++;
@@ -402,7 +406,7 @@ public class ParallelCircuitValue implements CircuitValue {
         //    otherwise we return false
         // 2. we've found less than or equal to number of values but have looked through all children
         //    so we return whether the found number fits the order we've wanted
-        setValue(order.compare(foundValues, number) > 0);
+        setValue(greaterThan ? foundValues > number : foundValues < number);
     }
 
 
