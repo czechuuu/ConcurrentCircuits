@@ -19,7 +19,7 @@ public class ParallelCircuitSolver implements CircuitSolver {
     }
 
     @Override
-    public CircuitValue solve(Circuit c) {
+    public synchronized CircuitValue solve(Circuit c) {
         if (!acceptsComputations) {
             return new BrokenCircuitValue();
         }
@@ -29,9 +29,8 @@ public class ParallelCircuitSolver implements CircuitSolver {
         return result;
     }
 
-
     @Override
-    public void stop() {
+    public synchronized void stop() {
         acceptsComputations = false;
         pool.shutdownNow();
     }

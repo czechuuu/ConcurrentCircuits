@@ -5,7 +5,6 @@ import cp2024.circuit.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-// TODO why must the NOT and IF be done in parallel? cant we reuse threads?
 
 public class ParallelCircuitValue implements CircuitValue {
     private final CircuitNode node;
@@ -249,6 +248,26 @@ public class ParallelCircuitValue implements CircuitValue {
         };
     }
 
+    private enum IFBranch {
+        CONDITION, TRUE, FALSE
+    }
+
+    private Callable<Optional<Boolean>> poolTaskForIfDoubleChannel(CircuitNode child, BlockingQueue<IFBranch> commChannel, IFBranch branch) {
+        ParallelCircuitValue valueOfChild = new ParallelCircuitValue(child, channelToChildren, pool);
+        return () -> {
+            try {
+                valueOfChild.computeValue();
+                commChannel.put(branch);
+                return Optional.of(valueOfChild.getValue());
+            } catch (InterruptedException e) {
+                return Optional.empty();
+            } catch (Exception e) {
+                // should be unreachable but i trust no one
+                return Optional.empty();
+            }
+        };
+    }
+
     /**
      * Tries to compute the value of the IF node.
      *
@@ -260,24 +279,56 @@ public class ParallelCircuitValue implements CircuitValue {
             final int conditionIndexInArgs = 0;
             final int ifTrueIndexInArgs = 1;
             final int ifFalseIndexInArgs = 2;
+            BlockingQueue<IFBranch> communicationChannel = new LinkedBlockingQueue<>();
 
             for (int i = ifTrueIndexInArgs; i <= ifFalseIndexInArgs; i++) {
                 CircuitNode child = args[i];
-                Callable<Optional<Boolean>> task = poolTaskForGivenChild(child);
+                Callable<Optional<Boolean>> task = poolTaskForIfDoubleChannel(child, communicationChannel,
+                        i == ifTrueIndexInArgs ? IFBranch.TRUE : IFBranch.FALSE);
                 Future<Optional<Boolean>> future = pool.submit(task);
                 childrenTasks.add(future);
             }
 
             CircuitNode condition = args[conditionIndexInArgs];
-            Future<Optional<Boolean>> conditionFuture = pool.submit(poolTaskForGivenChild(condition));
-            boolean conditionValue = conditionFuture.get().orElseThrow(InterruptedException::new); // can throw
+            Callable<Optional<Boolean>> conditionTask = poolTaskForIfDoubleChannel(condition, communicationChannel, IFBranch.CONDITION);
+            Future<Optional<Boolean>> conditionFuture = pool.submit(conditionTask);
+            int receivedChildValues = 0;
+            boolean receivedCondition = false;
 
-            checkForInterruption(); // if the computation of the condition was long, the result might not be needed anymore
+            // to return the value of an IF node one of the following must be satisfied:
+            // 1. the condition is known and its branch is known
+            // 2. both branches are known and equal
+            while (receivedChildValues < 2) {
+                IFBranch branch = communicationChannel.take();
+                receivedChildValues++;
+                checkForInterruption();
+                if (branch == IFBranch.CONDITION) {
+                    receivedCondition = true;
+                    boolean conditionValue = conditionFuture.get().orElseThrow(InterruptedException::new); // can throw
+                    int unusedBranchIndex = conditionValue ? 1 : 0;
+                    childrenTasks.get(unusedBranchIndex).cancel(true); // interrupt the computation of the unused branch
+                }
+            }
+
+            //
+            if (!receivedCondition) {
+                // if the condition future is not finished, but we repeated the above loop twice
+                // we must know the value of both branches
+                boolean valueOfTrueBranch = childrenTasks.get(0).get().orElseThrow(InterruptedException::new);
+                boolean valueOfFalseBranch = childrenTasks.get(1).get().orElseThrow(InterruptedException::new);
+                if (valueOfTrueBranch == valueOfFalseBranch) {
+                    setValue(valueOfTrueBranch);
+                    conditionFuture.cancel(true);
+                    return;
+                }
+            }
+
+            boolean conditionValue = conditionFuture.get().orElseThrow(InterruptedException::new); // can throw
             int resultIndex = conditionValue ? 0 : 1;
-            // try to get the result of the child, or if it failed, cancel and throw
+            int unusedBranchIndex = conditionValue ? 1 : 0;
+            childrenTasks.get(unusedBranchIndex).cancel(true); // interrupt the computation of the unused branch
             boolean result = childrenTasks.get(resultIndex).get().orElseThrow(InterruptedException::new);
             setValue(result);
-            propagateCancelToChildren(); // we don't need the child to compute a value that won't be read
         } catch (InterruptedException e) {
             cancel();
             throw e;

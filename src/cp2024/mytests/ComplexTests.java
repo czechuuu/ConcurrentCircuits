@@ -1,4 +1,4 @@
-package cp2024.tests;
+package cp2024.mytests;
 
 import cp2024.circuit.*;
 import cp2024.solution.ParallelCircuitSolver;
